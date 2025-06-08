@@ -1,193 +1,206 @@
-# infer.py
-
 import os
+import logging
 from glob import glob
 import soundfile as sf
-from scipy.io import wavfile
+import torch
 from rvc_python.modules.vc.modules import VC
 from rvc_python.configs.config import Config
 from rvc_python.download_model import download_rvc_models
 
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
 class RVCInference:
-    def __init__(self, models_dir="rvc_models", device="cpu:0", model_path=None, index_path="", version="v2"):
+    def __init__(self, models_dir="rvc_models", model_path=None, index_path="", version="v2"):
         self.models_dir = models_dir
-        self.device = device
         self.lib_dir = os.path.dirname(os.path.abspath(__file__))
+        self.device = self._detect_device()
         self.config = Config(self.lib_dir, self.device)
         self.vc = VC(self.lib_dir, self.config)
         self.current_model = None
         self.models = {}
 
         # Default parameters
-        self.f0method = "harvest"
-        self.f0up_key = 0
-        self.index_rate = 0.5
-        self.filter_radius = 3
-        self.resample_sr = 0
-        self.rms_mix_rate = 1
-        self.protect = 0.33
+        self.params = {
+            'f0method': 'harvest',
+            'f0up_key': 0,
+            'index_rate': 0.5,
+            'filter_radius': 3,
+            'resample_sr': 0,
+            'rms_mix_rate': 1,
+            'protect': 0.33
+        }
 
-        # Download Models (if necessary)
+        # Download models if necessary
         download_rvc_models(self.lib_dir)
 
         # Load available models
         self.models = self._load_available_models()
 
-        # Load model if model_path is provided
+        # Load model if provided
         if model_path:
-            self.load_model(model_path, version=version, index_path=index_path)
+            self.load_model(model_path, version, index_path)
+
+    def _detect_device(self):
+        """Detects and returns the best available device (GPU or CPU)."""
+        if torch.cuda.is_available():
+            logger.info("CUDA GPU detected")
+            return "cuda:0"
+        logger.info("Using CPU")
+        return "cpu:0"
 
     def _load_available_models(self):
-        """Loads a list of available models from the directory."""
+        """Loads available models from directory with optimized path handling."""
         models = {}
         for model_dir in glob(os.path.join(self.models_dir, "*")):
-            if os.path.isdir(model_dir):
-                model_name = os.path.basename(model_dir)
-                pth_file = glob(os.path.join(model_dir, "*.pth"))
-                index_file = glob(os.path.join(model_dir, "*.index"))
-                if pth_file:
-                    models[model_name] = {
-                        "pth": pth_file[0],
-                        "index": index_file[0] if index_file else None
-                    }
+            if not os.path.isdir(model_dir):
+                continue
+            model_name = os.path.basename(model_dir)
+            pth_file = next(iter(glob(os.path.join(model_dir, "*.pth"))), None)
+            index_file = next(iter(glob(os.path.join(model_dir, "*.index"))), None)
+            if pth_file:
+                models[model_name] = {"pth": pth_file, "index": index_file}
         return models
 
     def set_models_dir(self, new_models_dir):
-        """Sets a new directory for models and reloads available models."""
+        """Sets new models directory with validation."""
         if not os.path.isdir(new_models_dir):
+            logger.error(f"Directory {new_models_dir} does not exist")
             raise ValueError(f"Directory {new_models_dir} does not exist")
         self.models_dir = new_models_dir
         self.models = self._load_available_models()
+        logger.info(f"Models directory set to {new_models_dir}")
 
     def list_models(self):
-        """Returns a list of available models."""
+        """Returns list of available model names."""
         return list(self.models.keys())
 
     def load_model(self, model_path_or_name, version="v2", index_path=""):
-        """Loads a model into memory.
+        """Loads a model with optimized resource management."""
+        try:
+            model_info = self.models.get(model_path_or_name, {})
+            if model_path_or_name in self.models:
+                model_path = model_info["pth"]
+                index_path = model_info.get("index", "")
+                model_name = model_path_or_name
+            else:
+                model_path = model_path_or_name
+                model_name = os.path.basename(model_path)
+                if index_path and not os.path.isfile(index_path):
+                    logger.error(f"Index file {index_path} not found")
+                    raise ValueError(f"Index file {index_path} not found")
+                self.models[model_name] = {"pth": model_path, "index": index_path}
 
-        Args:
-            model_path_or_name (str): Path to the model file or model name if in models_dir.
-            version (str): Version of the model ('v1' or 'v2').
-            index_path (str): Path to the index file (optional).
-        """
-        # If model_path_or_name is a name in self.models, load from models_dir
-        if model_path_or_name in self.models:
-            model_info = self.models[model_path_or_name]
-            model_path = model_info["pth"]
-            index_path = model_info.get("index", "")
-            model_name = model_path_or_name
-        else:
-            # Else, assume it's a direct path
-            model_path = model_path_or_name
-            model_name = os.path.basename(model_path)
-            if index_path and not os.path.isfile(index_path):
-                raise ValueError(f"Index file {index_path} not found.")
-            # Update models dict
-            self.models[model_name] = {"pth": model_path, "index": index_path}
+            if not os.path.isfile(model_path):
+                logger.error(f"Model file {model_path} not found")
+                raise ValueError(f"Model file {model_path} not found")
 
-        if not os.path.isfile(model_path):
-            raise ValueError(f"Model file {model_path} not found.")
-
-        self.vc.get_vc(model_path, version)
-        self.current_model = model_name
-        print(f"Model {model_name} loaded.")
+            self.vc.get_vc(model_path, version)
+            self.current_model = model_name
+            logger.info(f"Model {model_name} loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to load model: {str(e)}")
+            raise
 
     def unload_model(self):
-        """Unloads the current model from memory."""
-        if self.current_model:
+        """Unloads the current model with cleanup."""
+        if not self.current_model:
+            logger.warning("No model loaded")
+            return
+        try:
             self.vc = VC(self.lib_dir, self.config)
             self.current_model = None
-            print("Model unloaded from memory.")
-        else:
-            print("No model loaded.")
+            logger.info("Model unloaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to unload model: {str(e)}")
+            raise
 
     def set_params(self, **kwargs):
-        """Sets parameters for generation."""
-        valid_params = [
-            "index_rate", "filter_radius", "resample_sr",
-            "rms_mix_rate", "protect", "f0up_key", "f0method"
-        ]
+        """Sets inference parameters with validation."""
         for key, value in kwargs.items():
-            if key in valid_params:
-                setattr(self, key, value)
+            if key in self.params:
+                self.params[key] = value
             else:
-                print(f"Warning: parameter {key} not recognized and will be ignored.")
+                logger.warning(f"Ignoring unrecognized parameter: {key}")
 
     def infer_file(self, input_path, output_path):
-        """Processes a single file.
-
-        Args:
-            input_path (str): Path to the input audio file.
-            output_path (str): Path to save the output audio file.
-        """
+        """Processes a single audio file with context management."""
         if not self.current_model:
-            raise ValueError("Please load a model first.")
+            logger.error("No model loaded")
+            raise ValueError("No model loaded")
 
-        model_info = self.models[self.current_model]
-        file_index = model_info.get("index", "")
+        try:
+            model_info = self.models[self.current_model]
+            file_index = model_info.get("index", "")
 
-        wav_opt = self.vc.vc_single(
-            sid=0,
-            input_audio_path=input_path,
-            f0_up_key=self.f0up_key,
-            f0_method=self.f0method,
-            file_index=file_index,
-            index_rate=self.index_rate,
-            filter_radius=self.filter_radius,
-            resample_sr=self.resample_sr,
-            rms_mix_rate=self.rms_mix_rate,
-            protect=self.protect,
-            f0_file="",
-            file_index2=""
-        )
+            with torch.no_grad():
+                wav_opt = self.vc.vc_single(
+                    sid=0,
+                    input_audio_path=input_path,
+                    f0_up_key=self.params['f0up_key'],
+                    f0_method=self.params['f0method'],
+                    file_index=file_index,
+                    index_rate=self.params['index_rate'],
+                    filter_radius=self.params['filter_radius'],
+                    resample_sr=self.params['resample_sr'],
+                    rms_mix_rate=self.params['rms_mix_rate'],
+                    protect=self.params['protect'],
+                    f0_file="",
+                    file_index2=""
+                )
 
-        wavfile.write(output_path, self.vc.tgt_sr, wav_opt)
-        return output_path
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            sf.write(output_path, wav_opt, self.vc.tgt_sr)
+            logger.info(f"Processed file saved to {output_path}")
+            return output_path
+        except Exception as e:
+            logger.error(f"Failed to process file {input_path}: {str(e)}")
+            raise
 
     def infer_dir(self, input_dir, output_dir):
-        """Processes all files in a directory.
-
-        Args:
-            input_dir (str): Path to the input directory containing audio files.
-            output_dir (str): Path to the output directory to save processed files.
-        """
+        """Processes all audio files in a directory."""
         if not self.current_model:
-            raise ValueError("Please load a model first.")
+            logger.error("No model loaded")
+            raise ValueError("No model loaded")
 
-        os.makedirs(output_dir, exist_ok=True)
-        audio_files = glob(os.path.join(input_dir, '*.*'))
-        processed_files = []
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            audio_files = [f for f in glob(os.path.join(input_dir, "*.*")) if os.path.isfile(f)]
+            processed_files = []
 
-        for input_audio_path in audio_files:
-            output_filename = os.path.splitext(os.path.basename(input_audio_path))[0] + '.wav'
-            output_path = os.path.join(output_dir, output_filename)
-            self.infer_file(input_audio_path, output_path)
-            processed_files.append(output_path)
+            for input_path in audio_files:
+                output_filename = os.path.splitext(os.path.basename(input_path))[0] + '.wav'
+                output_path = os.path.join(output_dir, output_filename)
+                processed_files.append(self.infer_file(input_path, output_path))
 
-        return processed_files
+            logger.info(f"Processed {len(processed_files)} files")
+            return processed_files
+        except Exception as e:
+            logger.error(f"Failed to process directory {input_dir}: {str(e)}")
+            raise
 
     def set_device(self, device):
-        """Sets the device for computations.
+        """Sets the computation device."""
+        try:
+            self.device = device
+            self.config.device = device
+            self.vc.device = device
+            logger.info(f"Device set to {device}")
+        except Exception as e:
+            logger.error(f"Failed to set device: {str(e)}")
+            raise
 
-        Args:
-            device (str): Device identifier (e.g., 'cpu:0', 'cuda:0').
-        """
-        self.device = device
-        self.config.device = device
-        self.vc.device = device
-
-# Usage example:
 if __name__ == "__main__":
-    rvc = RVCInference(
-        device="cuda:0",
-        model_path="path/to/model.pth",
-        index_path="path/to/index.index",
-        version="v2"
-    )
-    rvc.set_params(f0up_key=2, protect=0.5)
-
-    rvc.infer_file("input.wav", "output.wav")
-    rvc.infer_dir("input_dir", "output_dir")
-
-    rvc.unload_model()
+    try:
+        rvc = RVCInference(
+            model_path="path/to/model.pth",
+            index_path="path/to/index.index",
+            version="v2"
+        )
+        rvc.set_params(f0up_key=2, protect=0.5)
+        rvc.infer_file("input.wav", "output.wav")
+        rvc.infer_dir("input_dir", "output_dir")
+        rvc.unload_model()
+    except Exception as e:
+        logger.error(f"Main execution failed: {str(e)}")
